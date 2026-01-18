@@ -109,6 +109,70 @@ defmodule RNNTest do
     end
   end
 
+  describe "serializes sequence_last layer" do
+    test "sequence_last extracts last timestep" do
+      # [batch, seq_len, hidden] -> [batch, hidden]
+      model =
+        Axon.input("input", shape: {1, 10, 32})
+        |> sequence_last(name: "last")
+
+      assert_model_exports_and_runs!(model, {1, 10, 32})
+    end
+
+    test "lstm sequence with sequence_last and dense" do
+      # This is the pattern ExPhil uses: LSTM -> last timestep -> Dense
+      input = Axon.input("input", shape: {1, 10, 32})
+      {output_seq, _states} = Axon.lstm(input, 64, name: "lstm")
+      model = output_seq
+        |> sequence_last(name: "last")
+        |> Axon.dense(16, name: "output")
+
+      assert_model_exports_and_runs!(model, {1, 10, 32})
+    end
+
+    test "gru sequence with sequence_last and dense" do
+      input = Axon.input("input", shape: {1, 10, 32})
+      {output_seq, _state} = Axon.gru(input, 64, name: "gru")
+      model = output_seq
+        |> sequence_last(name: "last")
+        |> Axon.dense(16, name: "output")
+
+      assert_model_exports_and_runs!(model, {1, 10, 32})
+    end
+
+    test "stacked lstm with sequence_last" do
+      input = Axon.input("input", shape: {1, 8, 32})
+      {output1, _states1} = Axon.lstm(input, 64, name: "lstm1")
+      {output2, _states2} = Axon.lstm(output1, 32, name: "lstm2")
+      model = output2
+        |> sequence_last(name: "last")
+        |> Axon.dense(16, name: "output")
+
+      assert_model_exports_and_runs!(model, {1, 8, 32})
+    end
+  end
+
+  # Helper to create a sequence_last layer
+  # Extracts the last timestep from a sequence: [batch, seq_len, hidden] -> [batch, hidden]
+  # This is ONNX-serializable (unlike Axon.nx which uses arbitrary functions)
+  defp sequence_last(input, opts \\ []) do
+    name = opts[:name] || "sequence_last"
+
+    # Use Axon.layer/3 with signature: layer(op, inputs, opts)
+    # The op_name: :sequence_last tells axon_onnx how to serialize it
+    Axon.layer(
+      fn inputs, _opts ->
+        # Extract last timestep: [batch, seq_len, hidden] -> [batch, hidden]
+        seq_len = Nx.axis_size(inputs, 1)
+        Nx.slice_along_axis(inputs, seq_len - 1, 1, axis: 1)
+        |> Nx.squeeze(axes: [1])
+      end,
+      [input],
+      name: name,
+      op_name: :sequence_last
+    )
+  end
+
   # Helper that exports to ONNX and verifies it can be loaded by ONNX Runtime
   defp assert_model_exports_and_runs!(model, input_shape) do
     template = Nx.template(input_shape, {:f, 32})

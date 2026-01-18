@@ -1242,6 +1242,124 @@ defmodule AxonOnnx.Serialize do
     end
   end
 
+  ## Sequence Last (extract last timestep from sequence)
+  ## Input: [batch, seq_len, hidden] -> Output: [batch, hidden]
+  ## ONNX: Slice (last element) + Squeeze (remove axis 1)
+
+  defp to_onnx(
+         %Axon.Node{id: id, op_name: :sequence_last, name: name_fn, parent: [inp_id]},
+         nodes_map,
+         templates,
+         inputs,
+         param_names,
+         nodes,
+         op_counts,
+         cache
+       ) do
+    {inputs, param_names, nodes, op_counts, cache} =
+      to_onnx(
+        nodes_map[inp_id],
+        nodes_map,
+        templates,
+        inputs,
+        param_names,
+        nodes,
+        op_counts,
+        cache
+      )
+
+    input_name = cache[inp_id]
+
+    case cache do
+      %{^id => _} ->
+        {inputs, param_names, nodes, op_counts, cache}
+
+      %{} ->
+        name = name_fn.(:sequence_last, op_counts)
+        op_counts = Map.update(op_counts, :sequence_last, 1, fn x -> x + 1 end)
+        cache = Map.put(cache, id, name)
+
+        # Intermediate output names
+        slice_output = name <> "_slice"
+        starts_name = name <> "_starts"
+        ends_name = name <> "_ends"
+        axes_name = name <> "_axes"
+        squeeze_axes_name = name <> "_squeeze_axes"
+
+        # Create constant tensors for Slice parameters
+        # starts = [-1] (last element)
+        starts_tensor = Nx.tensor([-1], type: :s64)
+        starts_proto = to_tensor_proto(starts_tensor)
+        starts_attr = to_attr("value", :TENSOR, starts_proto)
+        starts_node = %Node{
+          input: [],
+          output: [starts_name],
+          name: starts_name,
+          attribute: [starts_attr],
+          op_type: "Constant"
+        }
+
+        # ends = [INT64_MAX] (to the end)
+        ends_tensor = Nx.tensor([9_223_372_036_854_775_807], type: :s64)
+        ends_proto = to_tensor_proto(ends_tensor)
+        ends_attr = to_attr("value", :TENSOR, ends_proto)
+        ends_node = %Node{
+          input: [],
+          output: [ends_name],
+          name: ends_name,
+          attribute: [ends_attr],
+          op_type: "Constant"
+        }
+
+        # axes = [1] (sequence dimension)
+        axes_tensor = Nx.tensor([1], type: :s64)
+        axes_proto = to_tensor_proto(axes_tensor)
+        axes_attr = to_attr("value", :TENSOR, axes_proto)
+        axes_node = %Node{
+          input: [],
+          output: [axes_name],
+          name: axes_name,
+          attribute: [axes_attr],
+          op_type: "Constant"
+        }
+
+        # Slice node: [batch, seq_len, hidden] -> [batch, 1, hidden]
+        slice_node = %Node{
+          input: [input_name, starts_name, ends_name, axes_name],
+          output: [slice_output],
+          name: slice_output,
+          op_type: "Slice"
+        }
+
+        # Squeeze axes constant for opset 13+
+        squeeze_axes_tensor = Nx.tensor([1], type: :s64)
+        squeeze_axes_proto = to_tensor_proto(squeeze_axes_tensor)
+        squeeze_axes_attr = to_attr("value", :TENSOR, squeeze_axes_proto)
+        squeeze_axes_node = %Node{
+          input: [],
+          output: [squeeze_axes_name],
+          name: squeeze_axes_name,
+          attribute: [squeeze_axes_attr],
+          op_type: "Constant"
+        }
+
+        # Squeeze node: [batch, 1, hidden] -> [batch, hidden]
+        squeeze_node = %Node{
+          input: [slice_output, squeeze_axes_name],
+          output: [name],
+          name: name,
+          op_type: "Squeeze"
+        }
+
+        new_nodes = [
+          squeeze_node, squeeze_axes_node, slice_node,
+          axes_node, ends_node, starts_node
+        ]
+
+        {inputs, param_names, new_nodes ++ nodes, op_counts, cache}
+    end
+  end
+
   defp to_attr(name, type, value) do
     case type do
       :INT ->
