@@ -1,13 +1,13 @@
-defmodule LSTMTest do
+defmodule RNNTest do
   use ExUnit.Case
 
-  @moduletag :lstm
+  @moduletag :rnn
 
   @moduledoc """
-  Tests for LSTM layer serialization.
+  Tests for LSTM and GRU layer serialization.
 
   Note: These tests verify that models export successfully and can be loaded
-  by ONNX Runtime. Numerical comparison is not performed because LSTM
+  by ONNX Runtime. Numerical comparison is not performed because RNN
   implementations may have subtle differences in gate ordering, numerical
   precision, or computational order between Axon and ONNX Runtime.
   """
@@ -55,8 +55,51 @@ defmodule LSTMTest do
     end
   end
 
+  describe "serializes GRU layers" do
+    test "gru output sequence only" do
+      input = Axon.input("input", shape: {1, 10, 32})
+      {output_seq, _state} = Axon.gru(input, 64, name: "my_gru")
+      model = output_seq
+
+      assert_model_exports_and_runs!(model, {1, 10, 32})
+    end
+
+    test "gru final hidden state with dense" do
+      input = Axon.input("input", shape: {1, 10, 32})
+      {_output_seq, {hidden}} = Axon.gru(input, 64, name: "my_gru")
+      model = hidden |> Axon.dense(16, name: "output")
+
+      assert_model_exports_and_runs!(model, {1, 10, 32})
+    end
+
+    test "gru sequence with dense (3D to 3D)" do
+      input = Axon.input("input", shape: {1, 10, 32})
+      {output_seq, _state} = Axon.gru(input, 64, name: "my_gru")
+      model = output_seq |> Axon.dense(16, name: "output")
+
+      assert_model_exports_and_runs!(model, {1, 10, 32})
+    end
+
+    test "gru with larger hidden size" do
+      input = Axon.input("input", shape: {1, 5, 16})
+      {output_seq, _state} = Axon.gru(input, 128, name: "my_gru")
+      model = output_seq
+
+      assert_model_exports_and_runs!(model, {1, 5, 16})
+    end
+
+    test "stacked gru layers" do
+      input = Axon.input("input", shape: {1, 8, 32})
+      {output1, _state1} = Axon.gru(input, 64, name: "gru1")
+      {output2, _state2} = Axon.gru(output1, 32, name: "gru2")
+      model = output2 |> Axon.dense(16, name: "output")
+
+      assert_model_exports_and_runs!(model, {1, 8, 32})
+    end
+  end
+
   describe "serializes Dense layer with 3D input" do
-    test "dense on 3D input without lstm" do
+    test "dense on 3D input without rnn" do
       # Verify that Dense works with 3D input (uses MatMul+Add instead of Gemm)
       model =
         Axon.input("input", shape: {1, 10, 32})

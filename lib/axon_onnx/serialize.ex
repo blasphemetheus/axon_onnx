@@ -91,9 +91,13 @@ defmodule AxonOnnx.Serialize do
       params_or_initializers
       |> Enum.reduce(%{}, fn {layer_name, params}, acc ->
         cond do
-          # Detect LSTM/GRU by presence of input_kernel/hidden_kernel/bias as maps
+          # Detect LSTM by presence of LSTM-specific gate keys (wii, wif, etc.)
           is_lstm_params?(params) ->
             flatten_lstm_params(acc, layer_name, params)
+
+          # Detect GRU by presence of GRU-specific gate keys (wiz, wir, win)
+          is_gru_params?(params) ->
+            flatten_gru_params(acc, layer_name, params)
 
           true ->
             # Standard flattening for other layers
@@ -946,6 +950,163 @@ defmodule AxonOnnx.Serialize do
     end
   end
 
+  ## GRU
+
+  defp to_onnx(
+         %Axon.Node{
+           id: id,
+           op: :gru,
+           name: name_fn,
+           parent: [input_id, _state_container_id, _index_id],
+           parameters: _params,
+           opts: _opts
+         },
+         nodes_map,
+         templates,
+         inputs,
+         param_names,
+         nodes,
+         op_counts,
+         cache
+       ) do
+    # Process input (skip state container and index - we'll use ONNX defaults)
+    {inputs, param_names, nodes, op_counts, cache} =
+      to_onnx(
+        nodes_map[input_id],
+        nodes_map,
+        templates,
+        inputs,
+        param_names,
+        nodes,
+        op_counts,
+        cache
+      )
+
+    input_name = cache[input_id]
+
+    # Early return if already processed
+    case cache do
+      %{^id => _} ->
+        {inputs, param_names, nodes, op_counts, cache}
+
+      %{} ->
+        name = name_fn.(:gru, op_counts)
+        op_counts = Map.update(op_counts, :gru, 1, fn x -> x + 1 end)
+
+        # GRU in ONNX outputs: Y (all hidden states), Y_h (final hidden)
+        # No cell state output unlike LSTM
+        output_seq_name = name <> "_output_sequence"
+        output_h_name = name <> "_h"
+
+        # Cache the GRU outputs as a tuple-like structure for :elem to extract
+        # GRU returns {output_seq, {hidden}} - only 2 outputs
+        cache = Map.put(cache, id, {output_seq_name, output_h_name})
+
+        # Get hidden_size from output shape
+        output_shape = Axon.get_output_shape(%Axon{output: id, nodes: nodes_map}, templates) |> extract_shape()
+        seq_shape = case output_shape do
+          [{batch, seq, hidden} | _rest] -> {batch, seq, hidden}
+          {_batch, _seq, _hidden} = shape -> shape
+          other -> raise "Unexpected GRU output shape: #{inspect(other)}"
+        end
+        hidden_size = elem(seq_shape, 2)
+
+        # Build ONNX GRU attributes
+        hidden_size_attr = to_attr("hidden_size", :INT, hidden_size)
+        direction_attr = to_attr("direction", :STRING, "forward")
+        # linear_before_reset=1 matches Axon's GRU implementation
+        linear_before_reset_attr = to_attr("linear_before_reset", :INT, 1)
+
+        # Parameter names for ONNX: W, R, B
+        w_name = name <> "_W"
+        r_name = name <> "_R"
+        b_name = name <> "_B"
+
+        updated_param_names = [w_name, r_name, b_name]
+
+        # Create intermediate names
+        transposed_input_name = name <> "_input_transposed"
+        gru_raw_output_name = name <> "_raw_output"
+        squeezed_output_name = name <> "_squeezed"
+
+        # 1. Transpose input: {batch, seq, features} -> {seq, batch, features}
+        perm_attr_in = to_attr("perm", :INTS, [1, 0, 2])
+        transpose_in_node = %Node{
+          input: [input_name],
+          output: [transposed_input_name],
+          name: name <> "_transpose_in",
+          attribute: [perm_attr_in],
+          op_type: "Transpose"
+        }
+
+        # 2. Squeeze the num_directions dimension (axis 1): {seq, 1, batch, hidden} -> {seq, batch, hidden}
+        squeeze_axes_name = name <> "_squeeze_axes"
+        squeeze_axes_tensor = Nx.tensor([1], type: {:s, 64})
+        squeeze_axes_value = to_attr("value", :TENSOR, to_tensor_proto(squeeze_axes_tensor))
+        squeeze_axes_node = %Node{
+          input: [],
+          output: [squeeze_axes_name],
+          name: squeeze_axes_name,
+          attribute: [squeeze_axes_value],
+          op_type: "Constant"
+        }
+
+        squeeze_node = %Node{
+          input: [gru_raw_output_name, squeeze_axes_name],
+          output: [squeezed_output_name],
+          name: name <> "_squeeze",
+          op_type: "Squeeze"
+        }
+
+        # 3. Transpose output: {seq, batch, hidden} -> {batch, seq, hidden}
+        perm_attr_out = to_attr("perm", :INTS, [1, 0, 2])
+        transpose_out_node = %Node{
+          input: [squeezed_output_name],
+          output: [output_seq_name],
+          name: name <> "_transpose_out",
+          attribute: [perm_attr_out],
+          op_type: "Transpose"
+        }
+
+        # 4. Squeeze Y_h: {num_directions=1, batch, hidden} -> {batch, hidden}
+        gru_raw_h_name = name <> "_raw_h"
+        squeeze_h_axes_name = name <> "_squeeze_h_axes"
+        squeeze_h_axes_tensor = Nx.tensor([0], type: {:s, 64})
+        squeeze_h_axes_value = to_attr("value", :TENSOR, to_tensor_proto(squeeze_h_axes_tensor))
+        squeeze_h_axes_node = %Node{
+          input: [],
+          output: [squeeze_h_axes_name],
+          name: squeeze_h_axes_name,
+          attribute: [squeeze_h_axes_value],
+          op_type: "Constant"
+        }
+
+        squeeze_h_node = %Node{
+          input: [gru_raw_h_name, squeeze_h_axes_name],
+          output: [output_h_name],
+          name: name <> "_squeeze_h",
+          op_type: "Squeeze"
+        }
+
+        # GRU node
+        gru_node = %Node{
+          input: [transposed_input_name, w_name, r_name, b_name],
+          output: [gru_raw_output_name, gru_raw_h_name],
+          name: name,
+          attribute: [hidden_size_attr, direction_attr, linear_before_reset_attr],
+          op_type: "GRU"
+        }
+
+        new_nodes = [
+          transpose_out_node, squeeze_node, squeeze_axes_node,
+          squeeze_h_node, squeeze_h_axes_node,
+          gru_node, transpose_in_node
+        ]
+
+        {inputs, updated_param_names ++ param_names, new_nodes ++ nodes, op_counts, cache}
+    end
+  end
+
   ## Recurrent State (skip - ONNX uses zeros by default)
 
   defp to_onnx(
@@ -1051,16 +1212,23 @@ defmodule AxonOnnx.Serialize do
         # LSTM outputs: {output_seq (3D), h (2D), c (2D)}
         this_shape = Axon.get_output_shape(%Axon{output: id, nodes: nodes_map}, templates) |> extract_shape()
 
-        # Determine which LSTM output this is based on shape
+        # Determine which RNN output this is based on shape
+        # LSTM outputs: {output_seq (3D), h (2D), c (2D)}
+        # GRU outputs: {output_seq (3D), h (2D)}
         output_name = case parent_outputs do
           {seq, h, _c} ->
-            # Infer from shape: output_seq is 3D, h and c are 2D
+            # LSTM: 3-tuple, infer from shape
             case this_shape do
               {_, _, _} -> seq  # 3D -> output sequence
               {_, _} ->
                 # 2D could be h or c - check opts or default to h
-                # In most cases, users want the hidden state (h)
                 opts[:index] || h
+            end
+          {seq, h} ->
+            # GRU: 2-tuple, infer from shape
+            case this_shape do
+              {_, _, _} -> seq  # 3D -> output sequence
+              {_, _} -> h      # 2D -> hidden state
             end
           name when is_binary(name) -> name
           _ -> "elem_#{id}"
@@ -1212,20 +1380,27 @@ defmodule AxonOnnx.Serialize do
 
   ## LSTM/GRU Weight Helpers
 
-  # Detect if params structure is from an LSTM/GRU layer
+  # Detect if params structure is from an LSTM layer (has wii, wif, wig, wio keys)
   defp is_lstm_params?(params) when is_map(params) do
-    has_input_kernel = Map.has_key?(params, "input_kernel")
-    has_hidden_kernel = Map.has_key?(params, "hidden_kernel")
-    has_bias = Map.has_key?(params, "bias")
-
-    # Check if input_kernel is a map with gate keys (not a tensor)
     input_kernel = params["input_kernel"]
-    input_kernel_is_map = is_map(input_kernel) and not is_struct(input_kernel, Nx.Tensor)
 
-    has_input_kernel and has_hidden_kernel and has_bias and input_kernel_is_map
+    is_map(input_kernel) and
+      not is_struct(input_kernel, Nx.Tensor) and
+      Map.has_key?(input_kernel, "wii")  # LSTM-specific key
   end
 
   defp is_lstm_params?(_), do: false
+
+  # Detect if params structure is from a GRU layer (has wiz, wir, win keys)
+  defp is_gru_params?(params) when is_map(params) do
+    input_kernel = params["input_kernel"]
+
+    is_map(input_kernel) and
+      not is_struct(input_kernel, Nx.Tensor) and
+      Map.has_key?(input_kernel, "wiz")  # GRU-specific key
+  end
+
+  defp is_gru_params?(_), do: false
 
   # Flatten LSTM params into ONNX format: W, R, B
   # Axon gate order: i (input), f (forget), g (cell), o (output)
@@ -1307,6 +1482,95 @@ defmodule AxonOnnx.Serialize do
     full_bias = Nx.concatenate([input_bias, hidden_bias], axis: 0)
 
     # Add num_directions dimension: {1, 8*hidden_size}
+    Nx.reshape(full_bias, {1, elem(Nx.shape(full_bias), 0)})
+  end
+
+  ## GRU Weight Helpers
+
+  # Flatten GRU params into ONNX format: W, R, B
+  # Axon gate order: z (update), r (reset), n (new/hidden)
+  # ONNX gate order: z (update), r (reset), h (hidden) - same order!
+  defp flatten_gru_params(acc, layer_name, params) do
+    input_kernel = params["input_kernel"]
+    hidden_kernel = params["hidden_kernel"]
+    bias = params["bias"]
+
+    # Extract individual gate weights from Axon's nested structure
+    # Input kernels: {input_size, hidden_size} each
+    wiz = input_kernel["wiz"]  # update gate
+    wir = input_kernel["wir"]  # reset gate
+    win = input_kernel["win"]  # hidden/new gate
+
+    # Hidden kernels: {hidden_size, hidden_size} each
+    whz = hidden_kernel["whz"]  # update gate
+    whr = hidden_kernel["whr"]  # reset gate
+    whn = hidden_kernel["whn"]  # hidden/new gate
+
+    # Biases: {hidden_size} each
+    # Axon has 4 biases for GRU: bz, br, bin, bhn
+    # bin = hidden gate input bias, bhn = hidden gate hidden bias
+    bz = bias["bz"]
+    br = bias["br"]
+    bin = bias["bin"]
+    bhn = bias["bhn"]
+
+    # Build ONNX W tensor: [num_directions, 3*hidden_size, input_size]
+    # Gate order: z, r, h (matches Axon)
+    w = build_gru_weight_matrix([wiz, wir, win])
+
+    # Build ONNX R tensor: [num_directions, 3*hidden_size, hidden_size]
+    r = build_gru_weight_matrix([whz, whr, whn])
+
+    # Build ONNX B tensor: [num_directions, 6*hidden_size]
+    # ONNX format: [Wb_z, Wb_r, Wb_h, Rb_z, Rb_r, Rb_h]
+    # Axon: bz, br are combined biases; bin/bhn are split for hidden gate
+    b = build_gru_bias(bz, br, bin, bhn)
+
+    acc
+    |> Map.put(layer_name <> "_W", w)
+    |> Map.put(layer_name <> "_R", r)
+    |> Map.put(layer_name <> "_B", b)
+  end
+
+  # Build W or R matrix for GRU: concatenate gate weights and add num_directions dim
+  # Input: list of 3 tensors in ONNX gate order (z, r, h)
+  # Each tensor: {in_size, hidden_size} for W, {hidden_size, hidden_size} for R
+  # Output: {1, 3*hidden_size, in_size}
+  defp build_gru_weight_matrix([wz, wr, wh]) do
+    # Transpose each from {in, hidden} to {hidden, in}
+    wz_t = Nx.transpose(wz)
+    wr_t = Nx.transpose(wr)
+    wh_t = Nx.transpose(wh)
+
+    # Concatenate along axis 0: {3*hidden_size, in_size}
+    concatenated = Nx.concatenate([wz_t, wr_t, wh_t], axis: 0)
+
+    # Add num_directions dimension: {1, 3*hidden_size, in_size}
+    Nx.reshape(concatenated, {1, elem(Nx.shape(concatenated), 0), elem(Nx.shape(concatenated), 1)})
+  end
+
+  # Build B tensor for GRU: [num_directions, 6*hidden_size]
+  # ONNX format: [Wb_z, Wb_r, Wb_h, Rb_z, Rb_r, Rb_h]
+  # Axon has: bz (update), br (reset), bin (hidden input), bhn (hidden recurrent)
+  defp build_gru_bias(bz, br, bin, bhn) do
+    hidden_size = elem(Nx.shape(bz), 0)
+
+    # For z and r gates, Axon has single combined bias
+    # We put it all in Wb_* and use zeros for Rb_*
+    zeros = Nx.broadcast(Nx.tensor(0.0, type: Nx.type(bz)), {hidden_size})
+
+    # Input biases: Wb_z, Wb_r, Wb_h
+    # Wb_z = bz, Wb_r = br, Wb_h = bin
+    input_bias = Nx.concatenate([bz, br, bin], axis: 0)
+
+    # Recurrent biases: Rb_z, Rb_r, Rb_h
+    # Rb_z = 0, Rb_r = 0, Rb_h = bhn
+    hidden_bias = Nx.concatenate([zeros, zeros, bhn], axis: 0)
+
+    # Concatenate: {6*hidden_size}
+    full_bias = Nx.concatenate([input_bias, hidden_bias], axis: 0)
+
+    # Add num_directions dimension: {1, 6*hidden_size}
     Nx.reshape(full_bias, {1, elem(Nx.shape(full_bias), 0)})
   end
 end
