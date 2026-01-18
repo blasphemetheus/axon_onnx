@@ -20,6 +20,15 @@ defmodule AxonOnnx.Serialize do
   @producer_name "AxonOnnx"
   @producer_version "0.3.0"
 
+  # Helper to extract shape from Axon.get_output_shape result
+  # In Axon 0.8+, this returns a tensor template instead of a tuple
+  defp extract_shape(%Nx.Tensor{} = tensor), do: Nx.shape(tensor)
+  defp extract_shape(shape) when is_tuple(shape), do: shape
+  defp extract_shape(map) when is_map(map) do
+    # Handle container outputs - extract shapes from each value
+    Map.new(map, fn {k, v} -> {k, extract_shape(v)} end)
+  end
+
   def __dump__(%Axon{} = axon, inputs, params, opts) do
     %Model{graph: %Graph{name: output_name}} =
       onnx_model = to_onnx_model(axon, inputs, params, opts)
@@ -66,7 +75,7 @@ defmodule AxonOnnx.Serialize do
           output_name_fn.(op, op_counts)
       end
 
-    output_shape = Axon.get_output_shape(axon, templates)
+    output_shape = Axon.get_output_shape(axon, templates) |> extract_shape()
 
     # Flatten params_or_initializers so it's no longer nested
     # TODO: This is going to be expensive, find a better way
@@ -264,7 +273,7 @@ defmodule AxonOnnx.Serialize do
           {name, op_counts, cache}
       end
 
-    input_shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates)
+    input_shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates) |> extract_shape()
     strides = opts[:strides] || 1
     strides = list_or_duplicate(:strides, strides, Nx.rank(input_shape) - 2)
     padding = opts[:padding]
@@ -343,7 +352,7 @@ defmodule AxonOnnx.Serialize do
           {name, op_counts, cache}
       end
 
-    input_shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates)
+    input_shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates) |> extract_shape()
 
     kernel_size = tuple_or_duplicate(:kernel_size, opts[:kernel_size], Nx.rank(input_shape) - 2)
     strides = opts[:strides] || Tuple.to_list(kernel_size)
@@ -481,8 +490,8 @@ defmodule AxonOnnx.Serialize do
         }
 
         constant_name = name <> "_squeeze_axes"
-        shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates)
-        axes = Enum.to_list(2..(Nx.rank(shape) - 1)//1)
+        shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates) |> extract_shape()
+        axes = Enum.to_list(2..(tuple_size(shape) - 1)//1)
         axes_tensor = nx_to_tensor_proto(constant_name, Nx.tensor(axes))
         value_attr = to_attr("value", :TENSOR, axes_tensor)
 
@@ -690,8 +699,14 @@ defmodule AxonOnnx.Serialize do
   end
 
   defp to_tensor_shape_proto(shape) do
+    # Handle both tuple shapes and tensor templates (Axon 0.8+ compat)
+    shape_tuple = case shape do
+      %Nx.Tensor{} -> Nx.shape(shape)
+      tuple when is_tuple(tuple) -> tuple
+    end
+
     dims =
-      shape
+      shape_tuple
       |> Tuple.to_list()
       |> Enum.map(fn
         nil ->
