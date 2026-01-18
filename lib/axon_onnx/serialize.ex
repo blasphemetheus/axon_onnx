@@ -57,23 +57,14 @@ defmodule AxonOnnx.Serialize do
   end
 
   defp to_onnx_graph(
-         %Axon{output: id, nodes: nodes} = axon,
+         %Axon{output: id, nodes: nodes_map} = axon,
          templates,
          params_or_initializers
        ) do
-    %Axon.Node{op: op, name: output_name_fn} = output_node = nodes[id]
+    %Axon.Node{op: op, op_name: op_name, name: output_name_fn} = output_node = nodes_map[id]
 
     {inputs, param_names, nodes, op_counts, cache} =
-      to_onnx(output_node, nodes, templates, [], [], [], %{}, %{})
-
-    output_name =
-      case cache do
-        %{^id => name} ->
-          name
-
-        %{} ->
-          output_name_fn.(op, op_counts)
-      end
+      to_onnx(output_node, nodes_map, templates, [], [], [], %{}, %{})
 
     output_shape = Axon.get_output_shape(axon, templates) |> extract_shape()
 
@@ -104,15 +95,56 @@ defmodule AxonOnnx.Serialize do
         end
       )
 
-    {output, _, _} = to_value_info(output_node, output_shape, op_counts, cache)
+    # Handle container (multi-output) vs single output models
+    {graph_name, graph_outputs} =
+      case op_name do
+        :container ->
+          # Container: multiple outputs from parent branches
+          output_names = cache[id] || []
+          parent_ids = output_node.parent
+
+          outputs =
+            Enum.zip(parent_ids, output_names)
+            |> Enum.map(fn {pid, name} ->
+              parent_node = nodes_map[pid]
+              # Get shape for this specific output
+              parent_shape = get_parent_shape(output_shape, pid, parent_ids)
+              {output_info, _, _} = to_value_info(parent_node, parent_shape, op_counts, cache)
+              output_info
+            end)
+
+          # Use first output name as graph name
+          {List.first(output_names) || "container", outputs}
+
+        _ ->
+          # Single output
+          output_name =
+            case cache do
+              %{^id => name} -> name
+              %{} -> output_name_fn.(op, op_counts)
+            end
+
+          {output_info, _, _} = to_value_info(output_node, output_shape, op_counts, cache)
+          {output_name, [output_info]}
+      end
 
     %Graph{
       node: Enum.reverse(nodes),
-      name: output_name,
+      name: graph_name,
       input: updated_inputs,
-      output: [output],
+      output: graph_outputs,
       initializer: initializers
     }
+  end
+
+  # Helper to get shape for a specific parent in a container
+  defp get_parent_shape(shape, _parent_id, _parent_ids) when is_tuple(shape), do: shape
+  defp get_parent_shape(shapes, parent_id, parent_ids) when is_map(shapes) do
+    # For map shapes (from container), find the matching key by index
+    idx = Enum.find_index(parent_ids, &(&1 == parent_id))
+    keys = Map.keys(shapes)
+    key = Enum.at(keys, idx)
+    Map.get(shapes, key, shapes)
   end
 
   defp to_onnx(
@@ -144,7 +176,7 @@ defmodule AxonOnnx.Serialize do
   end
 
   defp to_onnx(
-         %Axon.Node{op: :input, name: name} = axon,
+         %Axon.Node{id: id, op: :input, name: name_fn} = axon,
          _nodes_map,
          templates,
          inputs,
@@ -153,20 +185,28 @@ defmodule AxonOnnx.Serialize do
          op_counts,
          cache
        ) do
-    # TODO: Handle defaults
-    name = name.(:input, op_counts)
+    # Check if already processed (prevents duplicate inputs in multi-branch models)
+    case cache do
+      %{^id => _name} ->
+        # Already processed, skip
+        {inputs, param_names, nodes, op_counts, cache}
 
-    shape =
-      case templates do
-        %Nx.Tensor{} = tensor ->
-          Nx.shape(tensor)
+      %{} ->
+        # TODO: Handle defaults
+        name = name_fn.(:input, op_counts)
 
-        map ->
-          Nx.shape(map[name])
-      end
+        shape =
+          case templates do
+            %Nx.Tensor{} = tensor ->
+              Nx.shape(tensor)
 
-    {input_value, op_counts, cache} = to_value_info(axon, shape, op_counts, cache)
-    {[input_value | inputs], param_names, nodes, op_counts, cache}
+            map ->
+              Nx.shape(map[name])
+          end
+
+        {input_value, op_counts, cache} = to_value_info(axon, shape, op_counts, cache)
+        {[input_value | inputs], param_names, nodes, op_counts, cache}
+    end
   end
 
   ## Linear
@@ -639,6 +679,36 @@ defmodule AxonOnnx.Serialize do
 
     # Just forward to the next layer
     {inputs, param_names, [node | nodes], op_counts, cache}
+  end
+
+  ## Container (multi-output models)
+
+  defp to_onnx(
+         %Axon.Node{id: id, op_name: :container, parent: parent_ids},
+         nodes_map,
+         templates,
+         inputs,
+         param_names,
+         nodes,
+         op_counts,
+         cache
+       ) do
+    # Container nodes group multiple outputs together.
+    # We need to serialize all parent branches and collect their outputs.
+    # The container itself doesn't create an ONNX node - it's just a grouping.
+
+    {inputs, param_names, nodes, op_counts, cache} =
+      Enum.reduce(parent_ids, {inputs, param_names, nodes, op_counts, cache}, fn parent_id, acc ->
+        {inputs, param_names, nodes, op_counts, cache} = acc
+        parent_node = nodes_map[parent_id]
+        to_onnx(parent_node, nodes_map, templates, inputs, param_names, nodes, op_counts, cache)
+      end)
+
+    # Mark the container as processed by storing all parent output names
+    output_names = Enum.map(parent_ids, fn pid -> cache[pid] end)
+    cache = Map.put(cache, id, output_names)
+
+    {inputs, param_names, nodes, op_counts, cache}
   end
 
   defp to_attr(name, type, value) do
