@@ -23,10 +23,20 @@ defmodule AxonOnnx.Serialize do
   # Helper to extract shape from Axon.get_output_shape result
   # In Axon 0.8+, this returns a tensor template instead of a tuple
   defp extract_shape(%Nx.Tensor{} = tensor), do: Nx.shape(tensor)
-  defp extract_shape(shape) when is_tuple(shape), do: shape
   defp extract_shape(map) when is_map(map) do
     # Handle container outputs - extract shapes from each value
     Map.new(map, fn {k, v} -> {k, extract_shape(v)} end)
+  end
+  defp extract_shape(tuple) when is_tuple(tuple) do
+    # Could be a shape tuple like {1, 10} or a tuple of outputs like {tensor, tensor}
+    first = elem(tuple, 0)
+    if is_struct(first, Nx.Tensor) or is_map(first) or (is_tuple(first) and tuple_size(first) > 0 and is_struct(elem(first, 0), Nx.Tensor)) do
+      # Tuple of outputs - convert each
+      tuple |> Tuple.to_list() |> Enum.map(&extract_shape/1)
+    else
+      # Plain shape tuple like {1, 10}
+      tuple
+    end
   end
 
   def __dump__(%Axon{} = axon, inputs, params, opts) do
@@ -68,6 +78,13 @@ defmodule AxonOnnx.Serialize do
 
     output_shape = Axon.get_output_shape(axon, templates) |> extract_shape()
 
+    # Handle Axon.ModelState struct (Axon 0.8+ style)
+    params_or_initializers =
+      case params_or_initializers do
+        %Axon.ModelState{data: data} -> data
+        map when is_map(map) -> map
+      end
+
     # Flatten params_or_initializers so it's no longer nested
     # TODO: This is going to be expensive, find a better way
     params_or_initializers =
@@ -105,7 +122,7 @@ defmodule AxonOnnx.Serialize do
 
           outputs =
             Enum.zip(parent_ids, output_names)
-            |> Enum.map(fn {pid, name} ->
+            |> Enum.map(fn {pid, _name} ->
               parent_node = nodes_map[pid]
               # Get shape for this specific output
               parent_shape = get_parent_shape(output_shape, pid, parent_ids)
@@ -139,8 +156,13 @@ defmodule AxonOnnx.Serialize do
 
   # Helper to get shape for a specific parent in a container
   defp get_parent_shape(shape, _parent_id, _parent_ids) when is_tuple(shape), do: shape
+  defp get_parent_shape(shapes, parent_id, parent_ids) when is_list(shapes) do
+    # For list shapes (from tuple container), find by index
+    idx = Enum.find_index(parent_ids, &(&1 == parent_id))
+    Enum.at(shapes, idx) || List.first(shapes)
+  end
   defp get_parent_shape(shapes, parent_id, parent_ids) when is_map(shapes) do
-    # For map shapes (from container), find the matching key by index
+    # For map shapes (from map container), find the matching key by index
     idx = Enum.find_index(parent_ids, &(&1 == parent_id))
     keys = Map.keys(shapes)
     key = Enum.at(keys, idx)
@@ -241,31 +263,30 @@ defmodule AxonOnnx.Serialize do
 
     inp_name = cache[inp_id]
 
-    {name, op_counts, cache} =
-      case cache do
-        %{^id => name} ->
-          {name, op_counts, cache}
+    # Early return if already processed by another branch (shared layers)
+    case cache do
+      %{^id => _} ->
+        {inputs, param_names, nodes, op_counts, cache}
 
-        %{} ->
-          name = name_fn.(:dense, op_counts)
-          op_counts = Map.update(op_counts, :dense, 1, fn x -> x + 1 end)
-          cache = Map.put(cache, id, name)
-          {name, op_counts, cache}
-      end
+      %{} ->
+        name = name_fn.(:dense, op_counts)
+        op_counts = Map.update(op_counts, :dense, 1, fn x -> x + 1 end)
+        cache = Map.put(cache, id, name)
 
-    updated_param_names =
-      Enum.map(params, fn %{name: p_name} ->
-        name <> "_" <> p_name
-      end)
+        updated_param_names =
+          Enum.map(params, fn %{name: p_name} ->
+            name <> "_" <> p_name
+          end)
 
-    node = %Node{
-      input: [inp_name | updated_param_names],
-      output: [name],
-      name: name,
-      op_type: "Gemm"
-    }
+        node = %Node{
+          input: [inp_name | updated_param_names],
+          output: [name],
+          name: name,
+          op_type: "Gemm"
+        }
 
-    {inputs, updated_param_names ++ param_names, [node | nodes], op_counts, cache}
+        {inputs, updated_param_names ++ param_names, [node | nodes], op_counts, cache}
+    end
   end
 
   ## Convolution
@@ -301,54 +322,53 @@ defmodule AxonOnnx.Serialize do
 
     inp_name = cache[inp_id]
 
-    {name, op_counts, cache} =
-      case cache do
-        %{^id => name} ->
-          {name, op_counts, cache}
+    # Early return if already processed by another branch (shared layers)
+    case cache do
+      %{^id => _} ->
+        {inputs, param_names, nodes, op_counts, cache}
 
-        %{} ->
-          name = name_fn.(:conv, op_counts)
-          op_counts = Map.update(op_counts, :conv, 1, fn x -> x + 1 end)
-          cache = Map.put(cache, id, name)
-          {name, op_counts, cache}
-      end
+      %{} ->
+        name = name_fn.(:conv, op_counts)
+        op_counts = Map.update(op_counts, :conv, 1, fn x -> x + 1 end)
+        cache = Map.put(cache, id, name)
 
-    input_shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates) |> extract_shape()
-    strides = opts[:strides] || 1
-    strides = list_or_duplicate(:strides, strides, Nx.rank(input_shape) - 2)
-    padding = opts[:padding]
+        input_shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates) |> extract_shape()
+        strides = opts[:strides] || 1
+        strides = list_or_duplicate(:strides, strides, Nx.rank(input_shape) - 2)
+        padding = opts[:padding]
 
-    strides_attr = to_attr("strides", :INTS, strides)
+        strides_attr = to_attr("strides", :INTS, strides)
 
-    padding_attr =
-      case padding do
-        :valid ->
-          to_attr("auto_pad", :STRING, "VALID")
+        padding_attr =
+          case padding do
+            :valid ->
+              to_attr("auto_pad", :STRING, "VALID")
 
-        :same ->
-          to_attr("auto_pad", :STRING, "SAME_UPPER")
+            :same ->
+              to_attr("auto_pad", :STRING, "SAME_UPPER")
 
-        padding when is_list(padding) ->
-          {pad_begins, pad_ends} = Enum.unzip(padding)
-          to_attr("pads", :INTS, pad_begins ++ pad_ends)
-      end
+            padding when is_list(padding) ->
+              {pad_begins, pad_ends} = Enum.unzip(padding)
+              to_attr("pads", :INTS, pad_begins ++ pad_ends)
+          end
 
-    # TODO: Dilations
+        # TODO: Dilations
 
-    updated_param_names =
-      Enum.map(params, fn %{name: p_name} ->
-        name <> "_" <> p_name
-      end)
+        updated_param_names =
+          Enum.map(params, fn %{name: p_name} ->
+            name <> "_" <> p_name
+          end)
 
-    node = %Node{
-      input: [inp_name | updated_param_names],
-      output: [name],
-      name: name,
-      attribute: [strides_attr, padding_attr],
-      op_type: "Conv"
-    }
+        node = %Node{
+          input: [inp_name | updated_param_names],
+          output: [name],
+          name: name,
+          attribute: [strides_attr, padding_attr],
+          op_type: "Conv"
+        }
 
-    {inputs, updated_param_names ++ param_names, [node | nodes], op_counts, cache}
+        {inputs, updated_param_names ++ param_names, [node | nodes], op_counts, cache}
+    end
   end
 
   ## Pooling
@@ -380,68 +400,67 @@ defmodule AxonOnnx.Serialize do
 
     inp_name = cache[inp_id]
 
-    {name, op_counts, cache} =
-      case cache do
-        %{^id => name} ->
-          {name, op_counts, cache}
+    # Early return if already processed by another branch (shared layers)
+    case cache do
+      %{^id => _} ->
+        {inputs, param_names, nodes, op_counts, cache}
 
-        %{} ->
-          name = name_fn.(pool, op_counts)
-          op_counts = Map.update(op_counts, pool, 1, fn x -> x + 1 end)
-          cache = Map.put(cache, id, name)
-          {name, op_counts, cache}
-      end
+      %{} ->
+        name = name_fn.(pool, op_counts)
+        op_counts = Map.update(op_counts, pool, 1, fn x -> x + 1 end)
+        cache = Map.put(cache, id, name)
 
-    input_shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates) |> extract_shape()
+        input_shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates) |> extract_shape()
 
-    kernel_size = tuple_or_duplicate(:kernel_size, opts[:kernel_size], Nx.rank(input_shape) - 2)
-    strides = opts[:strides] || Tuple.to_list(kernel_size)
-    strides = list_or_duplicate(:strides, strides, Nx.rank(input_shape) - 2)
-    padding = opts[:padding]
+        kernel_size = tuple_or_duplicate(:kernel_size, opts[:kernel_size], Nx.rank(input_shape) - 2)
+        strides = opts[:strides] || Tuple.to_list(kernel_size)
+        strides = list_or_duplicate(:strides, strides, Nx.rank(input_shape) - 2)
+        padding = opts[:padding]
 
-    strides_attr = to_attr("strides", :INTS, strides)
-    kernel_shape_attr = to_attr("kernel_shape", :INTS, Tuple.to_list(kernel_size))
+        strides_attr = to_attr("strides", :INTS, strides)
+        kernel_shape_attr = to_attr("kernel_shape", :INTS, Tuple.to_list(kernel_size))
 
-    padding_attr =
-      case padding do
-        :valid ->
-          to_attr("auto_pad", :STRING, "VALID")
+        padding_attr =
+          case padding do
+            :valid ->
+              to_attr("auto_pad", :STRING, "VALID")
 
-        :same ->
-          to_attr("auto_pad", :STRING, "SAME_UPPER")
+            :same ->
+              to_attr("auto_pad", :STRING, "SAME_UPPER")
 
-        padding when is_list(padding) ->
-          {pad_begins, pad_ends} = Enum.unzip(padding)
-          to_attr("pads", :INTS, pad_begins ++ pad_ends)
-      end
+            padding when is_list(padding) ->
+              {pad_begins, pad_ends} = Enum.unzip(padding)
+              to_attr("pads", :INTS, pad_begins ++ pad_ends)
+          end
 
-    # TODO: Dilations
+        # TODO: Dilations
 
-    {op_type, extra_attrs} =
-      case pool do
-        :lp_pool ->
-          p_attr = to_attr("p", :INT, opts[:norm])
-          {"LpPool", [p_attr]}
+        {op_type, extra_attrs} =
+          case pool do
+            :lp_pool ->
+              p_attr = to_attr("p", :INT, opts[:norm])
+              {"LpPool", [p_attr]}
 
-        :max_pool ->
-          {"MaxPool", []}
+            :max_pool ->
+              {"MaxPool", []}
 
-        :avg_pool ->
-          count_include_pad_attr = to_attr("count_include_pad", :INT, 1)
-          {"AveragePool", [count_include_pad_attr]}
-      end
+            :avg_pool ->
+              count_include_pad_attr = to_attr("count_include_pad", :INT, 1)
+              {"AveragePool", [count_include_pad_attr]}
+          end
 
-    node_inputs = [inp_name]
+        node_inputs = [inp_name]
 
-    node = %Node{
-      input: node_inputs,
-      output: [name],
-      name: name,
-      attribute: [padding_attr, strides_attr, kernel_shape_attr | extra_attrs],
-      op_type: op_type
-    }
+        node = %Node{
+          input: node_inputs,
+          output: [name],
+          name: name,
+          attribute: [padding_attr, strides_attr, kernel_shape_attr | extra_attrs],
+          op_type: op_type
+        }
 
-    {inputs, param_names, [node | nodes], op_counts, cache}
+        {inputs, param_names, [node | nodes], op_counts, cache}
+    end
   end
 
   ## Global Pooling
@@ -479,80 +498,79 @@ defmodule AxonOnnx.Serialize do
 
     inp_name = cache[inp_id]
 
-    {name, op_counts, cache} =
-      case cache do
-        %{^id => name} ->
-          {name, op_counts, cache}
+    # Early return if already processed by another branch (shared layers)
+    case cache do
+      %{^id => _} ->
+        {inputs, param_names, nodes, op_counts, cache}
 
-        %{} ->
-          name = name_fn.(pool, op_counts)
-          op_counts = Map.update(op_counts, pool, 1, fn x -> x + 1 end)
-          cache = Map.put(cache, id, name)
-          {name, op_counts, cache}
-      end
+      %{} ->
+        name = name_fn.(pool, op_counts)
+        op_counts = Map.update(op_counts, pool, 1, fn x -> x + 1 end)
+        cache = Map.put(cache, id, name)
 
-    keep_axes = opts[:keep_axes]
+        keep_axes = opts[:keep_axes]
 
-    {op_type, attrs} =
-      case pool do
-        :global_avg_pool ->
-          {"GlobalAveragePool", []}
+        {op_type, attrs} =
+          case pool do
+            :global_avg_pool ->
+              {"GlobalAveragePool", []}
 
-        :global_lp_pool ->
-          {"GlobalLpPool", [to_attr("p", :INT, opts[:norm])]}
+            :global_lp_pool ->
+              {"GlobalLpPool", [to_attr("p", :INT, opts[:norm])]}
 
-        :global_max_pool ->
-          {"GlobalMaxPool", []}
-      end
+            :global_max_pool ->
+              {"GlobalMaxPool", []}
+          end
 
-    node_inputs = [inp_name]
+        node_inputs = [inp_name]
 
-    nodes =
-      if keep_axes do
-        node = %Node{
-          input: node_inputs,
-          output: [name],
-          name: name,
-          attribute: attrs,
-          op_type: op_type
-        }
+        nodes =
+          if keep_axes do
+            node = %Node{
+              input: node_inputs,
+              output: [name],
+              name: name,
+              attribute: attrs,
+              op_type: op_type
+            }
 
-        [node | nodes]
-      else
-        pre_squeeze_name = name <> "_pre_squeeze"
+            [node | nodes]
+          else
+            pre_squeeze_name = name <> "_pre_squeeze"
 
-        pre_squeeze_node = %Node{
-          input: node_inputs,
-          output: [pre_squeeze_name],
-          name: pre_squeeze_name,
-          attribute: attrs,
-          op_type: op_type
-        }
+            pre_squeeze_node = %Node{
+              input: node_inputs,
+              output: [pre_squeeze_name],
+              name: pre_squeeze_name,
+              attribute: attrs,
+              op_type: op_type
+            }
 
-        constant_name = name <> "_squeeze_axes"
-        shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates) |> extract_shape()
-        axes = Enum.to_list(2..(tuple_size(shape) - 1)//1)
-        axes_tensor = nx_to_tensor_proto(constant_name, Nx.tensor(axes))
-        value_attr = to_attr("value", :TENSOR, axes_tensor)
+            constant_name = name <> "_squeeze_axes"
+            shape = Axon.get_output_shape(%Axon{output: inp_id, nodes: nodes_map}, templates) |> extract_shape()
+            axes = Enum.to_list(2..(tuple_size(shape) - 1)//1)
+            axes_tensor = nx_to_tensor_proto(constant_name, Nx.tensor(axes))
+            value_attr = to_attr("value", :TENSOR, axes_tensor)
 
-        constant_node = %Node{
-          output: [constant_name],
-          name: constant_name,
-          attribute: [value_attr],
-          op_type: "Constant"
-        }
+            constant_node = %Node{
+              output: [constant_name],
+              name: constant_name,
+              attribute: [value_attr],
+              op_type: "Constant"
+            }
 
-        node = %Node{
-          input: [pre_squeeze_name, constant_name],
-          output: [name],
-          name: name,
-          op_type: "Squeeze"
-        }
+            node = %Node{
+              input: [pre_squeeze_name, constant_name],
+              output: [name],
+              name: name,
+              op_type: "Squeeze"
+            }
 
-        [node, constant_node, pre_squeeze_node | nodes]
-      end
+            [node, constant_node, pre_squeeze_node | nodes]
+          end
 
-    {inputs, param_names, nodes, op_counts, cache}
+        {inputs, param_names, nodes, op_counts, cache}
+    end
   end
 
   ## Activations
@@ -598,28 +616,27 @@ defmodule AxonOnnx.Serialize do
 
       input_name = cache[inp_id]
 
-      {name, op_counts, cache} =
-        case cache do
-          %{^id => name} ->
-            {name, op_counts, cache}
+      # Early return if already processed by another branch (shared layers)
+      case cache do
+        %{^id => _} ->
+          {inputs, param_names, nodes, op_counts, cache}
 
-          %{} ->
-            name = name_fn.(unquote(op), op_counts)
-            op_counts = Map.update(op_counts, unquote(op), 1, fn x -> x + 1 end)
-            cache = Map.put(cache, id, name)
-            {name, op_counts, cache}
-        end
+        %{} ->
+          name = name_fn.(unquote(op), op_counts)
+          op_counts = Map.update(op_counts, unquote(op), 1, fn x -> x + 1 end)
+          cache = Map.put(cache, id, name)
 
-      node_inputs = [input_name]
+          node_inputs = [input_name]
 
-      node = %Node{
-        input: node_inputs,
-        output: [name],
-        name: name,
-        op_type: unquote(onnx_op)
-      }
+          node = %Node{
+            input: node_inputs,
+            output: [name],
+            name: name,
+            op_type: unquote(onnx_op)
+          }
 
-      {inputs, param_names, [node | nodes], op_counts, cache}
+          {inputs, param_names, [node | nodes], op_counts, cache}
+      end
     end
   end
 
@@ -657,28 +674,27 @@ defmodule AxonOnnx.Serialize do
 
     input_name = cache[inp_id]
 
-    {name, op_counts, cache} =
-      case cache do
-        %{^id => name} ->
-          {name, op_counts, cache}
+    # Early return if already processed by another branch (shared layers)
+    case cache do
+      %{^id => _} ->
+        {inputs, param_names, nodes, op_counts, cache}
 
-        %{} ->
-          name = name_fn.(op, op_counts)
-          op_counts = Map.update(op_counts, op, 1, fn x -> x + 1 end)
-          cache = Map.put(cache, id, name)
-          {name, op_counts, cache}
-      end
+      %{} ->
+        name = name_fn.(op, op_counts)
+        op_counts = Map.update(op_counts, op, 1, fn x -> x + 1 end)
+        cache = Map.put(cache, id, name)
 
-    # For now just forward with an identity
-    node = %Node{
-      input: [input_name],
-      output: [name],
-      name: name,
-      op_type: "Identity"
-    }
+        # For now just forward with an identity
+        node = %Node{
+          input: [input_name],
+          output: [name],
+          name: name,
+          op_type: "Identity"
+        }
 
-    # Just forward to the next layer
-    {inputs, param_names, [node | nodes], op_counts, cache}
+        # Just forward to the next layer
+        {inputs, param_names, [node | nodes], op_counts, cache}
+    end
   end
 
   ## Container (multi-output models)
